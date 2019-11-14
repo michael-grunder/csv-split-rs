@@ -60,7 +60,7 @@ impl Trigger {
 
     fn new<P: AsRef<Path>>(cmd: &str, output_file: &P, num_rows: usize) -> Self {
         // Do variable replacements
-        let mut cmdstr = cmd
+        let cmdstr = cmd
             .to_owned()
             .replace("{}", &Self::full_path(output_file))
             .replace("{/}", &Self::file_name(output_file))
@@ -142,15 +142,38 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-impl Reader<File> {
+impl<R: Read> Reader<R> {
+    fn gz(rdr: R) -> Self {
+        Reader::Gzipped(GzDecoder::new(rdr))
+    }
+
+    fn bz(rdr: R) -> Self {
+        Reader::Bzipped(BzDecoder::new(rdr))
+    }
+
+    fn plain(rdr: R) -> Self {
+        Reader::Plain(rdr)
+    }
+
+    fn decoder(rdr: R, compression: CompressionType) -> Reader<R> {
+        match compression {
+            CompressionType::Gzip => Self::gz(rdr),
+            CompressionType::Bzip => Self::bz(rdr),
+            CompressionType::None => Self::plain(rdr),
+            _ => panic!("Must specify a specific compression type"),
+        }
+    }
+}
+
+impl<R: Read + Seek> Reader<R> {
     const GZIP_MAGIC_BYTES: [u8; 2] = [0x1F_u8, 0x8B];
     const BZIP_MAGIC_BYTES: [u8; 2] = [b'B', b'Z'];
 
-    fn detect_compression(file: &mut File) -> Result<CompressionType> {
+    fn detect_compression(rdr: &mut R) -> Result<CompressionType> {
         let mut bytes = [0_u8; 2];
 
-        file.read_exact(&mut bytes).context(Generic)?;
-        file.seek(SeekFrom::Start(0)).context(Generic)?;
+        rdr.read_exact(&mut bytes).context(Generic)?;
+        rdr.seek(SeekFrom::Start(0)).context(Generic)?;
 
         match bytes {
             Self::GZIP_MAGIC_BYTES => Ok(CompressionType::Gzip),
@@ -158,7 +181,9 @@ impl Reader<File> {
             _ => Ok(CompressionType::None),
         }
     }
+}
 
+impl Reader<File> {
     pub fn open<P: AsRef<Path>>(filename: P, compression: CompressionType) -> Result<Self> {
         let filename = filename.as_ref();
 
@@ -172,12 +197,7 @@ impl Reader<File> {
             compression
         };
 
-        // Return our reader
-        match ctype {
-            CompressionType::Gzip => Ok(Reader::Gzipped(GzDecoder::new(file))),
-            CompressionType::Bzip => Ok(Reader::Bzipped(BzDecoder::new(file))),
-            _ => Ok(Reader::Plain(file)),
-        }
+        Ok(Self::decoder(file, ctype))
     }
 
     pub fn open_csv<P: AsRef<Path>>(
@@ -193,6 +213,12 @@ impl Reader<File> {
             .from_reader(file);
 
         Ok(rdr)
+    }
+}
+
+impl Reader<std::io::Stdin> {
+    pub fn stdin() -> Self {
+        Self::decoder(std::io::stdin(), CompressionType::None)
     }
 }
 

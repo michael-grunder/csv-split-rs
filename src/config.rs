@@ -45,7 +45,7 @@ pub struct Config {
     pub max_rows: usize,
 
     #[structopt(long = "stdin", help = "Directs csv-split to read from standard input")]
-    stdin: bool,
+    pub stdin: bool,
 
     #[structopt(
         short = "i",

@@ -9,7 +9,7 @@ use structopt::StructOpt;
 mod config;
 mod file;
 
-fn open_input(cfg: &Config) -> csv::Reader<Reader<File>> {
+fn _open_file(cfg: &Config) -> csv::Reader<Reader<File>> {
     match Reader::open_csv(&cfg.file, cfg.headers, cfg.input_compression) {
         Ok(rdr) => rdr,
         Err(e) => {
@@ -19,10 +19,21 @@ fn open_input(cfg: &Config) -> csv::Reader<Reader<File>> {
     }
 }
 
+fn reader(cfg: &Config) -> Box<dyn std::io::Read> {
+    if cfg.stdin {
+        Box::new(Reader::stdin())
+    } else {
+        Box::new(Reader::open(&cfg.file, cfg.input_compression).unwrap())
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let cfg: Config = StructOpt::from_args();
 
-    let mut rdr = open_input(&cfg);
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .from_reader(reader(&cfg));
+
     let prefix = PathBuf::from(&cfg.file.file_name().unwrap());
 
     let mut wtr = SplitWriter::new(
