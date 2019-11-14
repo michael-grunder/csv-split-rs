@@ -1,0 +1,15 @@
+[package]
+name = "csv-split"
+version = "0.1.0"
+authors = ["michael-grunder <michael.grunder@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+structopt = "0.3.3"
+csv = "1.1.1"
+flate2 = "1.0.12"
+snafu = "0.6.0"
+bzip2 = "0.3.3"
+async-std = "1.0.0"
