@@ -1,5 +1,6 @@
 use crate::config::{CompressionType, TypeExtension};
 use bzip2::{read::BzDecoder, write::BzEncoder};
+use crossbeam::channel::{Receiver as CBReceiver, Sender as CBSender};
 use csv::{Writer as CsvWriter, WriterBuilder};
 use flate2::{read::GzDecoder, write::GzEncoder};
 use snafu::{ensure, ErrorCompat, ResultExt, Snafu};
@@ -8,15 +9,17 @@ use std::{
     io::{Read, Result as IoResult, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::mpsc,
+    thread,
 };
 
-pub enum Reader<R: Read> {
+pub enum Decoder<R: Read> {
     Plain(R),
     Gzipped(GzDecoder<R>),
     Bzipped(BzDecoder<R>),
 }
 
-pub enum Writer<W: Write> {
+pub enum Encoder<W: Write> {
     Plain(W),
     Gzipped(GzEncoder<W>),
     Bzipped(BzEncoder<W>),
@@ -31,10 +34,124 @@ pub struct SplitWriter {
     compression: CompressionType,
     group_column: Option<usize>,
     trigger: Option<String>,
-    writer: CsvWriter<Writer<File>>,
+    writer: CsvWriter<Encoder<File>>,
     last_value: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct BackgroundWriter {
+    tx: Option<CBSender<csv::StringRecord>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for BackgroundWriter {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+
+        self.handle
+            .take()
+            .unwrap()
+            .join()
+            .expect("Failed to wait on background worker thread");
+    }
+}
+
+impl BackgroundWriter {
+    pub fn new<P: AsRef<Path>>(
+        path: P,
+        prefix: P,
+        max_rows: usize,
+        compression: CompressionType,
+        group_column: Option<usize>,
+        trigger: &Option<String>,
+    ) -> Result<Self> {
+        let (tx, rx) = crossbeam::channel::unbounded();
+
+        let mut writer =
+            SplitWriter::new(path, prefix, max_rows, compression, group_column, trigger)?;
+
+        Ok(Self {
+            tx: Some(tx),
+            handle: Some(std::thread::spawn(move || {
+                while let Ok(msg) = rx.recv() {
+                    writer.write_record(&msg).unwrap();
+                }
+            })),
+        })
+    }
+
+    #[inline]
+    pub fn write_record(&mut self, row: &csv::StringRecord) -> Result<()> {
+        self.tx
+            .as_ref()
+            .unwrap()
+            .send(row.to_owned())
+            .map_err(|_| Error::Delivery)
+    }
+}
+
+//struct SplitFile<W>
+//where
+//    W: Write,
+//{
+//    group_column: Option<usize>,
+//    group_value: Option<String>,
+//    row_count: usize,
+//    max_rows: usize,
+//    writer: csv::Writer<Encoder<W>>,
+//}
+//
+//impl SplitFile<File> {
+//    pub fn new<P: AsRef<Path>>(
+//        filename: P,
+//        compression: CompressionType,
+//        group_column: Option<usize>,
+//    ) -> Result<Self> {
+//        let writer = csv::WriterBuilder::new()
+//            .has_headers(false)
+//            .from_writer(Encoder::create(filename, compression)?);
+//
+//        Ok(Self {
+//            group_column,
+//            row_count: 0,
+//            max_rows: 0,
+//            group_value: None,
+//            writer,
+//        })
+//    }
+//
+//    fn group_value<'a>(&'a self, row: &'a csv::StringRecord) -> Option<&'a str> {
+//        if let Some(n) = self.group_column {
+//            if row.len() > n {
+//                return Some(&row[n]);
+//            }
+//        }
+//
+//        None
+//    }
+//
+//    fn check(&mut self, row: &csv::StringRecord) -> bool {
+//        if self.row_count >= self.max_rows {
+//            match (self.group_value.as_ref(), self.group_value(row)) {
+//                (Some(a), Some(b)) => a == b,
+//                _ => false,
+//            }
+//        } else {
+//            false
+//        }
+//    }
+//
+//    fn push(&mut self, row: &csv::StringRecord) -> Result<()> {
+//        if let Some(gc) = self.group_column {
+//            self.group_value = row.get(gc).map_or(None, |v| Some(v.to_owned()));
+//        }
+//
+//        self.row_count += 1;
+//        self.writer.write_record(row).context(Csv)
+//    }
+//}
+
+#[derive(Debug)]
 struct Trigger {
     cmdstr: String,
     cmd: Command,
@@ -78,7 +195,7 @@ impl Trigger {
     }
 }
 
-impl<R> Read for Reader<R>
+impl<R> Read for Decoder<R>
 where
     R: Read,
 {
@@ -91,7 +208,7 @@ where
     }
 }
 
-impl<W> Write for Writer<W>
+impl<W> Write for Encoder<W>
 where
     W: Write,
 {
@@ -138,24 +255,27 @@ pub enum Error {
 
     #[snafu(display("CSV I/O error: {}", source))]
     Csv { source: csv::Error },
+
+    #[snafu(display("Sync error"))]
+    Delivery,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-impl<R: Read> Reader<R> {
+impl<R: Read> Decoder<R> {
     fn gz(rdr: R) -> Self {
-        Reader::Gzipped(GzDecoder::new(rdr))
+        Decoder::Gzipped(GzDecoder::new(rdr))
     }
 
     fn bz(rdr: R) -> Self {
-        Reader::Bzipped(BzDecoder::new(rdr))
+        Decoder::Bzipped(BzDecoder::new(rdr))
     }
 
     fn plain(rdr: R) -> Self {
-        Reader::Plain(rdr)
+        Decoder::Plain(rdr)
     }
 
-    fn decoder(rdr: R, compression: CompressionType) -> Reader<R> {
+    fn decoder(rdr: R, compression: CompressionType) -> Decoder<R> {
         match compression {
             CompressionType::Gzip => Self::gz(rdr),
             CompressionType::Bzip => Self::bz(rdr),
@@ -165,7 +285,7 @@ impl<R: Read> Reader<R> {
     }
 }
 
-impl<R: Read + Seek> Reader<R> {
+impl<R: Read + Seek> Decoder<R> {
     const GZIP_MAGIC_BYTES: [u8; 2] = [0x1F_u8, 0x8B];
     const BZIP_MAGIC_BYTES: [u8; 2] = [b'B', b'Z'];
 
@@ -183,7 +303,7 @@ impl<R: Read + Seek> Reader<R> {
     }
 }
 
-impl Reader<File> {
+impl Decoder<File> {
     pub fn open<P: AsRef<Path>>(filename: P, compression: CompressionType) -> Result<Self> {
         let filename = filename.as_ref();
 
@@ -199,24 +319,9 @@ impl Reader<File> {
 
         Ok(Self::decoder(file, ctype))
     }
-
-    pub fn open_csv<P: AsRef<Path>>(
-        filename: P,
-        headers: bool,
-        compression: CompressionType,
-    ) -> Result<csv::Reader<Self>> {
-        let file = Self::open(filename, compression)?;
-
-        let rdr = csv::ReaderBuilder::new()
-            .has_headers(headers)
-            .flexible(true)
-            .from_reader(file);
-
-        Ok(rdr)
-    }
 }
 
-impl Reader<std::io::Stdin> {
+impl Decoder<std::io::Stdin> {
     pub fn stdin() -> Self {
         Self::decoder(std::io::stdin(), CompressionType::None)
     }
@@ -251,8 +356,8 @@ impl SplitWriter {
     fn get_writer<P: AsRef<Path>>(
         filename: P,
         compression: CompressionType,
-    ) -> Result<csv::Writer<Writer<File>>> {
-        let writer = Writer::create(filename, compression)?;
+    ) -> Result<csv::Writer<Encoder<File>>> {
+        let writer = Encoder::create(filename, compression)?;
         Ok(csv::WriterBuilder::new().from_writer(writer))
     }
 
@@ -317,7 +422,6 @@ impl SplitWriter {
         Ok(())
     }
 
-    #[inline]
     pub fn write_record(&mut self, row: &csv::StringRecord) -> Result<()> {
         if self.on_row >= self.max_rows {
             let in_group = if let Some(gc) = self.group_column {
@@ -362,7 +466,7 @@ impl Drop for SplitWriter {
     }
 }
 
-impl Writer<File> {
+impl Encoder<File> {
     pub fn create<P: AsRef<Path>>(filename: P, compression: CompressionType) -> Result<Self> {
         let filename = filename.as_ref();
 

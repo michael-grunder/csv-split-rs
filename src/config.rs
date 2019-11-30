@@ -86,6 +86,9 @@ pub struct Config {
     )]
     pub suffix_len: usize,
 
+    #[structopt(long = "async", help = "Whether to use sync or async writer")]
+    pub bg_writer: bool,
+
     #[structopt(help = "Our input filename to process")]
     pub file: PathBuf,
 
