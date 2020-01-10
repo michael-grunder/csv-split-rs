@@ -1,2 +1,10 @@
 /target
 **/*.rs.bk
+src-stash
+data
+rust-csv
+backup
+iou
+iowut
+rusty-tags.vi
+*.gz

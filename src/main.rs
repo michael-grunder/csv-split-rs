@@ -1,90 +1,102 @@
-use crate::config::CompressionType;
-use crate::{
-    config::Config,
-    file::{BackgroundWriter, Decoder, SplitWriter},
+use self::{
+    config::{CompressionType, Config},
+    file::Decoder,
+    io::{BufferCache, CsvBuffer, CsvBuffers, IouWrite},
 };
-use async_std::task;
-use iou::IoUring;
+use csv::ReaderBuilder;
+use itertools::Itertools;
 use structopt::StructOpt;
+
+use std::{
+    convert::Into,
+    error::Error,
+    fs::File,
+    path::{Path, PathBuf},
+};
 
 mod config;
 mod file;
 mod io;
+mod writer;
 
-use std::{
-    collections::HashMap,
-    error::Error,
-    fs::File,
-    io::{BufRead, BufReader, IoSlice, IoSliceMut},
-    os::unix::io::AsRawFd,
-    path::{Path, PathBuf},
-};
+fn file_prefix(filename: &Path) -> PathBuf {
+    filename.file_stem().unwrap().into()
+}
 
-fn iou_split(filename: &str, nfiles: usize) {
-    let mut iou = iou::IoUring::new(4096).unwrap();
-    let (mut sq, mut cq, _) = iou.queues();
+fn get_reader<P: AsRef<Path>>(
+    file: P,
+    compression: CompressionType,
+) -> Result<csv::Reader<Decoder<File>>, Box<dyn Error>> {
+    let compression = match compression {
+        CompressionType::None => CompressionType::Detect,
+        _ => compression,
+    };
 
-    let mut writes = 0;
-    let mut offset = 0;
-    let mut n = 0;
-
-    let mut files = vec![];
-    let mut fds = vec![];
-
-    for fid in 0..nfiles {
-        let file = File::create(&format!("/tmp/{}.txt", fid)).unwrap();
-        let fd = file.as_raw_fd();
-
-        files.push(file);
-        fds.push(fd);
-    }
-
-    let mut boxes = vec![];
-    let mut offsets = HashMap::new();
-    let bytes = std::fs::read_to_string(filename)
-        .unwrap()
-        .as_bytes()
-        .to_vec();
-
-    for chunk in bytes.chunks(128) {
-        match sq.next_sqe() {
-            Some(mut sqe) => unsafe {
-                let buffer = Box::new([IoSlice::new(chunk)]);
-                sqe.prep_write_vectored(
-                    fds[n % nfiles],
-                    &*buffer,
-                    *offsets.get(&fds[n % nfiles]).or(Some(&0)).unwrap(),
-                );
-                *offsets.entry(fds[n % nfiles]).or_insert(0) += buffer[0].len();
-
-                offset += buffer[0].len();
-                boxes.push(buffer);
-                writes += 1;
-                n += 1;
-            },
-            None => {
-                while writes > 0 {
-                    let sq = cq.wait_for_cqe().unwrap();
-                    let nwritten = sq.result().unwrap();
-                    println!("[{}]: {} bytes", writes, nwritten);
-                    writes -= 1;
-                }
-            }
-        }
-    }
-
-    while writes > 0 {
-        let cqe = cq.wait_for_cqe().unwrap();
-        let id = cqe.user_data() as usize;
-        let n = cqe.result().unwrap();
-        println!("[{}]: Final {} bytes", id, n);
-        writes -= 1;
-    }
+    let input = Decoder::open(file.as_ref(), compression)?;
+    Ok(ReaderBuilder::new().has_headers(false).from_reader(input))
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let args = std::env::args().collect::<Vec<_>>();
-    let nfiles: usize = args[2].parse().expect("Can't parse number");
-    iou_split(&args[1], nfiles);
+    let opts = Config::from_args();
+
+    let mut on_file = 1;
+    let mut on_row = 0;
+
+    let mut rdr = get_reader(&opts.file, opts.input_compression)?;
+    let mut buffers = BufferCache::new(opts.queue_depth as usize, opts.buffer_size);
+    let mut wtr = buffers.pop();
+
+    if let Some(group_col) = opts.group_column {
+        for (_, mut rows) in &rdr
+            .byte_records()
+            .filter_map(Result::ok)
+            .group_by(|row| row[group_col].to_owned())
+        {
+            if on_row == opts.max_rows || wtr.remaining() <= 1024 {
+                wtr = buffers.submit_and_pop(wtr);
+
+                if on_row == opts.max_rows {
+                    on_file += 1;
+                    buffers.next(&format!("{:05}.csv", on_file));
+                    on_row = 0;
+                }
+            }
+
+            // The first row in a given group, we can split the file here
+            let row = rows.next().unwrap();
+            wtr.write_row(&row);
+
+            // Now we're in a group which must all stay together
+            while let Some(row) = rows.next() {
+                if wtr.write_row(&row) <= 1024 {
+                    wtr = buffers.submit_and_pop(wtr);
+
+                    on_file += 1;
+                    buffers.next(&format!("{:05}.csv", on_file));
+                    on_row = 0;
+                }
+            }
+        }
+    } else {
+        for row in rdr.byte_records().filter_map(|r| r.ok()) {
+            if on_row == opts.max_rows || wtr.remaining() <= 1024 {
+                wtr = buffers.submit_and_pop(wtr);
+
+                if on_row == opts.max_rows {
+                    on_file += 1;
+                    buffers.next(&format!("{:05}.csv", on_file));
+                    on_row = 0;
+                }
+            }
+
+            wtr.write_row(&row);
+            on_row += 1;
+        }
+
+        if wtr.pos() > 0 {
+            buffers.submit(wtr);
+        }
+    }
+
     Ok(())
 }

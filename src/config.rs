@@ -79,15 +79,28 @@ pub struct Config {
     pub headers: bool,
 
     #[structopt(
+        short = "q",
+        long = "queue-depth",
+        help = "io_uring queue depth / buffer count",
+        default_value = "32"
+    )]
+    pub queue_depth: usize,
+
+    #[structopt(
+        short = "b",
+        long = "buffer-size",
+        help = "Buffer size",
+        default_value = "32768"
+    )]
+    pub buffer_size: usize,
+
+    #[structopt(
         short = "a",
         long = "suffix-length",
         help = "Generate suffixes of length N",
         default_value = "2"
     )]
     pub suffix_len: usize,
-
-    #[structopt(long = "async", help = "Whether to use sync or async writer")]
-    pub bg_writer: bool,
 
     #[structopt(help = "Our input filename to process")]
     pub file: PathBuf,
