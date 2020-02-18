@@ -1,15 +1,12 @@
-use csv::ByteRecord;
 use csv_core::Writer as CsvWriter;
 use iou::{IoUring, SubmissionFlags};
 use std::{
     collections::HashMap,
     convert::{From, TryInto},
-    error::Error,
     fs::File,
-    io::{self, IoSlice},
+    io::IoSlice,
     os::unix::io::AsRawFd,
     path::Path,
-    pin::Pin,
 };
 
 pub trait VectoredWrite {
@@ -204,7 +201,7 @@ impl<'a> IouWrites<'a> {
         Self {
             iou: IoUring::new(queue_depth).unwrap(),
             writes: HashMap::new(),
-            next_id: 42,
+            next_id: 0,
             in_flight: 0,
         }
     }
@@ -212,12 +209,10 @@ impl<'a> IouWrites<'a> {
     pub fn write_and_store(&mut self, fd: i32, buffer: CsvBuffer, offset: usize) -> u64 {
         let (id, io) = (self.next_id, buffer.into_boxed_write());
 
-        let len = io.write[0].len();
-
         unsafe {
             let mut sq = self.iou.sq();
             let mut sqe = sq.next_sqe().unwrap();
-            sqe.prep_write_vectored(fd, &io.write, offset);
+            sqe.prep_write_vectored(fd, io.as_write(), offset);
             sqe.set_flags(SubmissionFlags::IO_LINK);
             sqe.set_user_data(id);
             self.iou.sq().submit().unwrap();
@@ -238,8 +233,6 @@ impl<'a> IouWrites<'a> {
         cqe: iou::CompletionQueueEvent,
     ) -> CsvBuffer {
         let id = cqe.user_data();
-        let len = cqe.result().unwrap();
-
         let write = *writes.remove(&id).unwrap();
         write.into()
     }

@@ -1,27 +1,18 @@
 use self::{
     config::{CompressionType, Config},
     file::Decoder,
-    io::{BufferCache, CsvBuffer, CsvBuffers, IouWrite},
+    io::BufferCache,
 };
 use csv::ReaderBuilder;
 use itertools::Itertools;
 use structopt::StructOpt;
 
-use std::{
-    convert::Into,
-    error::Error,
-    fs::File,
-    path::{Path, PathBuf},
-};
+use std::{error::Error, fs::File, path::Path};
 
 mod config;
 mod file;
 mod io;
 mod writer;
-
-fn file_prefix(filename: &Path) -> PathBuf {
-    filename.file_stem().unwrap().into()
-}
 
 fn get_reader<P: AsRef<Path>>(
     file: P,
